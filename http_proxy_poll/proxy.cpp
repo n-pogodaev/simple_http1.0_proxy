@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <set>
 #include <sys/types.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <vector>
@@ -25,12 +26,12 @@
 char transfer_buf[TRANSFER_BUF_SIZE];
 
 const char *http_scheme = "http://";
-const char *http_server_error = "HTTP/1.0 500 Internal Server Error\r\n\r\n";
-const char *http_service_unavailable = "HTTP/1.0 503 Service Unavailable\r\n\r\n";
-const char *http_version_unsupported = "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n";
-const char *http_length_required = "HTTP/1.0 411 Length Required\r\n\r\n";
-const char *http_method_not_allowed = "HTTP/1.0 405 Method Not Allowed\r\nAllow: GET, HEAD, POST, DELETE, PUT\r\n\r\n";
-const char *http_bad_request = "HTTP/1.0 400 Bad Request\r\n\r\n";
+const char *http_server_error = "HTTP/1.0 500 Internal Server Error\r\n\r\n<html><head>Server Error</head><body></body></html>";
+const char *http_service_unavailable = "HTTP/1.0 503 Service Unavailable\r\n\r\n<html><head>Service Unavailable</head><body></body></html>";
+const char *http_version_unsupported = "HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n<html><head>Version Not Supported</head><body></body></html>";
+const char *http_length_required = "HTTP/1.0 411 Length Required\r\n\r\n<html><head>Length Required</head><body></body></html>";
+const char *http_method_not_allowed = "HTTP/1.0 405 Method Not Allowed\r\nAllow: GET, HEAD, POST, DELETE, PUT\r\n\r\n<html><head>Method Not Allowed</head><body></body></html>";
+const char *http_bad_request = "HTTP/1.0 400 Bad Request\r\n\r\n<html><head>Bad Request</head><body></body></html>";
 
 bool is_interrupted = false;
 
@@ -103,7 +104,7 @@ void at_exit(poll_requests *p_requests) {
 
 bool add_to_poll_requests(poll_requests *p_requests, int fd, bool write, bool read) {
     if (p_requests->count == p_requests->size) {
-        struct pollfd *new_poll_requests = (struct pollfd *) realloc(p_requests->requests,
+        auto *new_poll_requests = (struct pollfd *) realloc(p_requests->requests,
                                                                      p_requests->size * 2 * sizeof(struct pollfd));
         if (!new_poll_requests) {
             return false;
@@ -220,7 +221,7 @@ int create_listen_socket(const char *port) {
     int yes = 1;
     struct addrinfo *p = listen_info;
     for (; p; p= p->ai_next) {
-        if ((listen_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) {
+        if ((listen_fd = socket(p->ai_family, p->ai_socktype | SOCK_NONBLOCK, p->ai_protocol)) < 0) {
             perror("create listening socket");
             continue;
         }
@@ -253,9 +254,18 @@ int get_new_client(int listen_fd) {
     struct sockaddr_in client_addr{};
     socklen_t client_addr_size = sizeof client_addr;
     int new_client = accept(listen_fd, (struct sockaddr *)&client_addr, &client_addr_size);
-    if (new_client < 0) {
+    if (new_client < 0 && errno != EWOULDBLOCK && errno != EAGAIN) {
         perror("accepting new client");
-    } else {
+    } else if (new_client >= 0) {
+        int flags = fcntl(new_client, F_GETFL);
+        if (flags < 0) {
+            perror("fcntl");
+            return -1;
+        }
+        if (fcntl(new_client, F_SETFL, flags | O_NONBLOCK) < 0) {
+            perror("fcntl");
+            return -1;
+        }
         printf("accepted new client\n");
     }
     return new_client;
@@ -294,25 +304,18 @@ int connect_to_server(const std::string &hostname) {
         fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(err));
         return -1;
     }
-    struct addrinfo *p = server_info;
-    for (; p; p = p->ai_next) {
-        if ((server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0) {
-            perror("create socket to connect");
-            continue;
-        }
-        if (connect(server_fd, p->ai_addr, p->ai_addrlen) < 0) {
-            close(server_fd);
-            perror("connect to server");
-            continue;
-        }
-        break;
-    }
-    freeaddrinfo(server_info);
-    if (!p) {
-        fprintf(stderr, "can't connect to any server address");
+    if ((server_fd = socket(server_info->ai_family, server_info->ai_socktype | SOCK_NONBLOCK, server_info->ai_protocol)) < 0) {
+        perror("create socket to connect");
+        freeaddrinfo(server_info);
         return -1;
     }
-    printf("Connected to %s\n", hostname.c_str());
+    if (connect(server_fd, server_info->ai_addr, server_info->ai_addrlen) < 0 && errno != EINPROGRESS) {
+            freeaddrinfo(server_info);
+            perror("connect to server");
+            close(server_fd);
+            return -1;
+    }
+    freeaddrinfo(server_info);
     return server_fd;
 }
 
@@ -456,18 +459,28 @@ int parse_full_http_response(const std::string &response, parsed_http &parsed_bu
 }
 
 int send_data(int fd, const char *buf, size_t buf_len) {
-    int send_res = send(fd, buf, buf_len, MSG_NOSIGNAL);
-    if (send_res < 0 && errno == ENOMEM) {
-        clean_cache_map();
-        return 0;
+    int send_res = send(fd, buf, buf_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+    if (send_res < 0) {
+        if (errno == ENOMEM) {
+            clean_cache_map();
+            return 0;
+        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            return 0;
+        } else {
+            perror("send");
+        }
     }
     return send_res;
 }
 
 int recv_data(int fd, char *buf, size_t buf_len) {
-    int recv_res = recv(fd, buf, buf_len, 0);
+    int recv_res = recv(fd, buf, buf_len, MSG_DONTWAIT);
     if (recv_res < 0) {
-        perror("recv");
+        if (errno != EWOULDBLOCK && errno != EAGAIN) {
+            perror("recv");
+        } else {
+            return 0;
+        }
     }
     return recv_res;
 }
@@ -520,14 +533,14 @@ void create_cache_entry(cache **new_cache_entry) {
     }
 }
 
-void create_server_send(http_buf &buf, struct pollfd *poll, poll_requests *p_requests, bool caching, size_t request_head_length) {
+void create_server_send(http_buf &buf, struct pollfd *poll, poll_requests *p_requests, bool caching, long request_head_length) {
     if (!extract_hostname_from_request(buf.buf, buf.parsed_buf.path, buf.parsed_buf.method.length())) {
         return_error_to_client(buf, poll, http_bad_request, p_requests);
         return;
     }
     int server_fd = connect_to_server(buf.parsed_buf.path);
-    if (server_fd < 0) {
-        return_error_to_client(buf, poll, http_service_unavailable, p_requests);
+    if (server_fd == -1) {
+        return_error_to_client(buf, poll, http_server_error, p_requests);
         return;
     }
     if (!buf_map_insert(server_fd, http_buf(SERVER_SEND))) {
@@ -661,6 +674,7 @@ void server_delete_cache(cache *c) {
             for (auto it = cache_map.begin(); it != cache_map.end(); ++it) {
                 if (it->second == c) {
                     cache_map.erase(it);
+                    break;
                 }
             }
             delete c;
@@ -736,7 +750,24 @@ void process_server_receive(http_buf &buf, struct pollfd *poll, poll_requests *p
                 server_error(buf, poll, http_server_error, p_requests);
                 return;
             }
-            if (cache_map.find(buf.buf) != cache_map.end()) { // response has been completely parsed
+            auto cache_map_found_record = cache_map.find(buf.buf);
+            if (cache_map_found_record != cache_map.end()) { // response has been completely parsed
+                if (cache_map_found_record->second != buf.cache) {
+                    if (!int_set_insert(cache_map_found_record->second->waiting_clients, buf.opposite_fd)) {
+                        server_error(buf, poll, http_server_error, p_requests);
+                        return;
+                    }
+                    auto client_buf_it = buf_map.find(buf.opposite_fd);
+                    if (client_buf_it != buf_map.end()) {
+                        http_buf &client_buf = client_buf_it->second;
+                        client_buf.cache = cache_map_found_record->second;
+                        get_from_poll_requests(buf.opposite_fd, p_requests)->events |= POLLOUT;
+                    } else {
+                        cache_map_found_record->second->waiting_clients.erase(buf.opposite_fd);
+                    }
+                    server_delete_cache(buf.cache);
+                    reset_connection(poll->fd, p_requests);
+                }
                 if (buf.cache->waiting_clients.empty()) {
                     server_delete_cache(buf.cache);
                     reset_connection(poll->fd, p_requests);
