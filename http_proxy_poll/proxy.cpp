@@ -767,6 +767,7 @@ void process_server_receive(http_buf &buf, struct pollfd *poll, poll_requests *p
                     }
                     server_delete_cache(buf.cache);
                     reset_connection(poll->fd, p_requests);
+                    return;
                 }
                 if (buf.cache->waiting_clients.empty()) {
                     server_delete_cache(buf.cache);
