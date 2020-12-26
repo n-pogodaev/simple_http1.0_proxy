@@ -499,7 +499,7 @@ void unsub_from_cache(int fd, cache *c) {
             for (auto it = cache_map.begin(); it != cache_map.end(); ++it) {
                 if (it->second == c) {
                     cache_map.erase(it);
-                    delete[] c;
+                    delete c;
                     break;
                 }
             }
