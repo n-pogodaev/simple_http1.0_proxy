@@ -510,7 +510,8 @@ void unsub_from_cache(int fd, cache *c) {
 void return_error_to_client(http_buf &buf, struct pollfd *poll, const char *http_error, poll_requests *p_requests) {
     buf.type = CLIENT_SEND;
     poll->events = POLLOUT;
-    //unsub_from_cache(poll->fd, buf.cache);
+    unsub_from_cache(poll->fd, buf.cache);
+    buf.bytes_sent = 0;
     buf.parsed_buf.content_length = strlen(http_error);
     buf.buf.clear();
     if (!str_append(buf.buf, http_error, strlen(http_error))) {
@@ -879,7 +880,7 @@ void process_client_send(http_buf &buf, struct pollfd *poll, poll_requests *p_re
             }
             buf.bytes_sent += sent;
             buf.buf.erase(0, sent);
-            if (buf.bytes_sent == buf.parsed_buf.content_length) {
+            if (buf.bytes_sent >= buf.parsed_buf.content_length) {
                 reset_connection(poll->fd, p_requests);
             } else if (buf.buf.empty()) {
                 poll->events = 0;
