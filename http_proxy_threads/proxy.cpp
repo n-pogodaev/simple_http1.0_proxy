@@ -116,7 +116,7 @@ void cond_broadcast(pthread_cond_t *cond) {
 
 void cache_read_lock(cache *c, size_t bytes_sent) {
     lock_mutex(&c->mutex);
-    while(c->response.length() >= bytes_sent && !c->is_error && !c->is_full) {
+    while(c->response.length() <= bytes_sent && !c->is_error && !c->is_full) {
         cond_wait(&c->read_condition, &c->mutex);
     }
     ++c->readers;
@@ -125,7 +125,7 @@ void cache_read_lock(cache *c, size_t bytes_sent) {
 
 void cache_read_unlock(cache *c) {
     lock_mutex(&c->mutex);
-    if (--c->readers) {
+    if (--c->readers == 0) {
         cond_broadcast(&c->write_condition);
     }
     unlock_mutex(&c->mutex);
@@ -164,7 +164,6 @@ void free_cache_entry(cache *c) {
 
 bool clean_cache_map() {
     int deleted = 0;
-    lock_mutex(&cache_map_mutex);
     for (auto it = cache_map.cbegin(); it != cache_map.cend();) {
         if (it->second->clients_num == 0 && it->second->is_full) {
             free_cache_entry(it->second);
@@ -174,7 +173,6 @@ bool clean_cache_map() {
             ++it;
         }
     }
-    unlock_mutex(&cache_map_mutex);
     return deleted;
 }
 
@@ -204,7 +202,9 @@ void create_cache_entry(cache **new_cache_entry) {
     try {
         *new_cache_entry = new cache;
     } catch (std::bad_alloc &) {
+        lock_mutex(&cache_map_mutex);
         clean_cache_map();
+        unlock_mutex(&cache_map_mutex);
         try {
             *new_cache_entry = new cache;
         } catch (std::bad_alloc &) {
@@ -219,7 +219,6 @@ void create_cache_entry(cache **new_cache_entry) {
 }
 
 bool cache_map_insert(const std::string &request, cache *c) {
-    lock_mutex(&cache_map_mutex);
     try {
         cache_map.insert({request, c});
     } catch (std::bad_alloc &) {
@@ -227,11 +226,9 @@ bool cache_map_insert(const std::string &request, cache *c) {
         try {
             cache_map.insert({request, c});
         } catch(std::bad_alloc &) {
-            unlock_mutex(&cache_map_mutex);
             return false;
         }
     }
-    unlock_mutex(&cache_map_mutex);
     return true;
 }
 
@@ -254,7 +251,9 @@ void create_http_buf(http_buf **new_http_buf) {
     try {
         *new_http_buf = new http_buf;
     } catch (std::bad_alloc &) {
+        lock_mutex(&cache_map_mutex);
         clean_cache_map();
+        unlock_mutex(&cache_map_mutex);
         try {
             *new_http_buf = new http_buf;
         } catch (std::bad_alloc &) {
@@ -287,7 +286,9 @@ thread_arg *create_thread_arg() {
     try {
         ta = new thread_arg;
     } catch (std::bad_alloc &) {
+        lock_mutex(&cache_map_mutex);
         clean_cache_map();
+        unlock_mutex(&cache_map_mutex);
         try {
             ta = new thread_arg;
         } catch (std::bad_alloc &) {
@@ -375,14 +376,16 @@ bool is_supported_method(const char *method) {
 }
 
 bool is_version_supported(int minor_version) {
-    return minor_version == 0;
+    return minor_version == 0 || minor_version == 1;
 }
 
 bool str_append(std::string &str, const char *buf, size_t bytes_num) {
     try {
         str.append(buf, bytes_num);
     } catch (std::bad_alloc &) {
+        lock_mutex(&cache_map_mutex);
         clean_cache_map();
+        unlock_mutex(&cache_map_mutex);
         try {
             str.append(buf, bytes_num);
         } catch (std::bad_alloc &) {
@@ -396,7 +399,9 @@ bool str_insert(std::string &str1, const std::string &str2, size_t start_pos) {
     try {
         str1.insert(start_pos, str2);
     } catch (std::bad_alloc &) {
+        lock_mutex(&cache_map_mutex);
         clean_cache_map();
+        unlock_mutex(&cache_map_mutex);
         try {
             str1.insert(start_pos, str2);
         } catch (std::bad_alloc &) {
@@ -465,7 +470,9 @@ int parse_full_http_request(http_buf &buf) {
             buf.parsed_buf.method.append(method, method_len);
             buf.parsed_buf.path.append(path, path_len);
         } catch (std::bad_alloc &) {
+            lock_mutex(&cache_map_mutex);
             clean_cache_map();
+            unlock_mutex(&cache_map_mutex);
             try {
                 if (buf.parsed_buf.method.compare(0, method_len, method, method_len) != 0) {
                     buf.parsed_buf.method.append(method, method_len);
@@ -508,7 +515,9 @@ int send_data(int fd, const char *buf, size_t buf_len) {
     int send_res = send(fd, buf, buf_len, MSG_NOSIGNAL);
     if (send_res < 0) {
         if (errno == ENOMEM) {
+            lock_mutex(&cache_map_mutex);
             clean_cache_map();
+            unlock_mutex(&cache_map_mutex);
             return 0;
         } else if (errno == EINTR) {
             return 0;
@@ -541,7 +550,9 @@ void server_delete_cache(cache *c) {
     if (c) {
         lock_mutex(&cache_map_mutex);
         if (c->clients_num > 0) {
+            cache_write_lock(c);
             c->is_error = true;
+            cache_write_unlock(c);
         } else {
             for (auto it = cache_map.begin(); it != cache_map.end(); ++it) {
                 if (it->second == c) {
@@ -576,6 +587,7 @@ void reset_client_connection(int client_fd, http_buf *server_buf, http_buf *clie
     if (!server_buf) {
         free_http_buf(client_buf);
         close(client_fd);
+        return;
     }
     lock_mutex(&server_buf->mutex);
     lock_mutex(&client_buf->mutex);
@@ -747,13 +759,16 @@ bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) 
                 client_buf->buf.erase(scheme_in_request, strlen(http_scheme));
             }
             if (is_get_or_head_method(client_buf->parsed_buf.method.c_str())) {
+                lock_mutex(&cache_map_mutex);
                 auto found_cache_entry = cache_map.find(client_buf->buf);
                 if (found_cache_entry != cache_map.end()) {
                     client_buf->cache = found_cache_entry->second;
                     ++client_buf->cache->clients_num;
+                    unlock_mutex(&cache_map_mutex);
                     client_buf->buf.clear();
                     client_buf->buf.shrink_to_fit();
                 } else {
+                    unlock_mutex(&cache_map_mutex);
                     create_server_send(client_buf, client_fd, true, -1, server_buf);
                 }
                 return true;
@@ -797,6 +812,8 @@ bool server_send(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                     cond_wait(&server_buf->condition, &server_buf->mutex);
                 }
                 unlock_mutex(&server_buf->mutex);
+            } else {
+                unlock_mutex(&server_buf->mutex);
             }
         } else { // request doesn't have a content
             int sent = send_data(server_fd, server_buf->buf.c_str() + server_buf->bytes_sent, server_buf->buf.length() - server_buf->bytes_sent);
@@ -834,14 +851,15 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
         if (server_buf->cache) { // caching mode, buf.buf contains get or head request
             cache_write_lock(server_buf->cache);
             if (!str_append(server_buf->cache->response, server_buf->transfer_buf, received)) {
+                cache_write_unlock(server_buf->cache);
                 server_error(server_fd, server_buf, client_buf, http_server_error);
                 return;
             }
-            cache_write_unlock(server_buf->cache);
             lock_mutex(&cache_map_mutex);
             auto cache_map_found_record = cache_map.find(server_buf->buf);
             if (cache_map_found_record != cache_map.end()) { // response has been completely parsed
                 if (cache_map_found_record->second != server_buf->cache) {
+                    cache_write_unlock(server_buf->cache);
                     ++cache_map_found_record->second->clients_num;
                     lock_mutex(&client_buf->mutex);
                     client_buf->cache = cache_map_found_record->second;
@@ -853,6 +871,7 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                     return;
                 }
                 if (server_buf->cache->clients_num == 0) {
+                    cache_write_unlock(server_buf->cache);
                     unlock_mutex(&cache_map_mutex);
                     server_delete_cache(server_buf->cache);
                     reset_server_connection(server_fd, server_buf, client_buf);
@@ -861,10 +880,13 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 unlock_mutex(&cache_map_mutex);
                 if (server_buf->cache->response.length() >= server_buf->parsed_buf.content_length) {
                     server_buf->cache->is_full = true;
+                    cache_write_unlock(server_buf->cache);
                     reset_server_connection(server_fd, server_buf, client_buf);
                     return;
                 }
+                cache_write_unlock(server_buf->cache);
             } else {
+                cache_write_unlock(server_buf->cache);
                 unlock_mutex(&cache_map_mutex);
                 int parse_res = parse_full_http_response(server_buf->cache->response, server_buf->parsed_buf);
                 if (parse_res == -1 || (parse_res == -2 && received == 0)) {
@@ -927,13 +949,16 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
             reset_client_connection(client_fd, server_buf, client_buf);
             return;
         }
+        lock_mutex(&client_buf->mutex);
         if (client_buf->cache) { // cache mode
+            unlock_mutex(&client_buf->mutex);
+            cache_read_lock(client_buf->cache, client_buf->bytes_sent);
             if (client_buf->cache->is_error) {
+                cache_read_unlock(client_buf->cache);
                 unsub_from_cache(client_buf->cache);
                 reset_client_connection(client_fd, server_buf, client_buf);
                 return;
             }
-            cache_read_lock(client_buf->cache, client_buf->bytes_sent);
             int sent = send_data(client_fd, client_buf->cache->response.c_str() + client_buf->bytes_sent,
                                  client_buf->cache->response.length() - client_buf->bytes_sent);
             if (sent < 0) {
@@ -951,7 +976,13 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
             }
             cache_read_unlock(client_buf->cache);
         } else { // through mode
-            lock_mutex(&client_buf->mutex);
+            if (!client_buf->cache && client_buf->buf.empty()) {
+                while (!client_buf->cache && client_buf->buf.empty()) {
+                    cond_wait(&client_buf->condition, &client_buf->mutex);
+                }
+                unlock_mutex(&client_buf->mutex);
+                continue;
+            }
             int sent = send_data(client_fd, client_buf->buf.c_str(), client_buf->buf.length());
             if (sent < 0) {
                 unlock_mutex(&client_buf->mutex);
@@ -968,6 +999,8 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
                 while (client_buf->buf.empty()) {
                     cond_wait(&client_buf->condition, &client_buf->mutex);
                 }
+                unlock_mutex(&client_buf->mutex);
+            } else {
                 unlock_mutex(&client_buf->mutex);
             }
         }
