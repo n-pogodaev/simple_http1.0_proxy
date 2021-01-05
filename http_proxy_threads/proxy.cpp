@@ -20,7 +20,7 @@
 #define MAX_HEADERS 100
 #define BACKLOG 10
 
-#define TRANSFER_BUF_SIZE 1024
+#define TRANSFER_BUF_SIZE 8192
 
 const char *http_scheme = "http://";
 const char *http_server_error = "HTTP/1.0 500 Internal Server Error\r\n\r\n<html><head>Server Error</head><body></body></html>";
@@ -65,6 +65,7 @@ struct http_buf {
     size_t bytes_sent{};
     volatile bool is_error{};
     struct cache *cache{nullptr}; // for caching mode
+    bool cache_in_map{};
     pthread_mutex_t mutex;
     pthread_cond_t condition;
 };
@@ -874,20 +875,8 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 return;
             }
             cache_write_unlock(server_buf->cache);
-            lock_mutex(&cache_map_mutex);
-            auto cache_map_found_record = cache_map.find(server_buf->buf);
-            if (cache_map_found_record != cache_map.end()) { // response has been completely parsed
-                if (cache_map_found_record->second != server_buf->cache) {
-                    ++cache_map_found_record->second->clients_num;
-                    lock_mutex(&client_buf->mutex);
-                    client_buf->cache = cache_map_found_record->second;
-                    unlock_mutex(&cache_map_mutex);
-                    cond_broadcast(&client_buf->condition);
-                    unlock_mutex(&client_buf->mutex);
-                    server_delete_cache(server_buf->cache);
-                    reset_server_connection(server_fd, server_buf, client_buf);
-                    return;
-                }
+            if (server_buf->cache_in_map) {
+                lock_mutex(&cache_map_mutex);
                 if (server_buf->cache->clients_num == 0) {
                     unlock_mutex(&cache_map_mutex);
                     server_delete_cache(server_buf->cache);
@@ -903,32 +892,50 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                     return;
                 }
             } else {
-                unlock_mutex(&cache_map_mutex);
-                int parse_res = parse_full_http_response(server_buf->cache->response, server_buf->parsed_buf);
-                if (parse_res == -1 || (parse_res == -2 && received == 0)) {
-                    server_error(server_fd, server_buf, client_buf, http_server_error);
-                    return;
-                } else if (parse_res >= 0) {
-                    lock_mutex(&client_buf->mutex);
-                    if (server_buf->parsed_buf.status == 200 && server_buf->parsed_buf.content_length != -1 &&
-                    server_buf->parsed_buf.content_length <= MAX_CACHED_RESPONSE_SIZE) {
-                        lock_mutex(&cache_map_mutex);
-                        if (!cache_map_insert(server_buf->buf, server_buf->cache)) {
-                            server_error(server_fd, server_buf, client_buf, http_server_error);
-                            return;
-                        }
-                        ++server_buf->cache->clients_num;
+                lock_mutex(&cache_map_mutex);
+                auto cache_map_found_record = cache_map.find(server_buf->buf);
+                if (cache_map_found_record != cache_map.end()) { // response has been completely parsed
+                    if (cache_map_found_record->second != server_buf->cache) {
+                        ++cache_map_found_record->second->clients_num;
+                        lock_mutex(&client_buf->mutex);
+                        client_buf->cache = cache_map_found_record->second;
                         unlock_mutex(&cache_map_mutex);
-                        client_buf->cache = server_buf->cache;
-                        server_buf->parsed_buf.content_length += parse_res;
-                    } else {
-                        client_buf->buf.swap(server_buf->cache->response);
-                        client_buf->parsed_buf.content_length = client_buf->buf.length() + 1;
+                        cond_broadcast(&client_buf->condition);
+                        unlock_mutex(&client_buf->mutex);
                         server_delete_cache(server_buf->cache);
-                        server_buf->cache = nullptr;
+                        reset_server_connection(server_fd, server_buf, client_buf);
+                        return;
                     }
-                    cond_broadcast(&client_buf->condition);
-                    unlock_mutex(&client_buf->mutex);
+                    unlock_mutex(&cache_map_mutex);
+                    server_buf->cache_in_map = true;
+                } else {
+                    unlock_mutex(&cache_map_mutex);
+                    int parse_res = parse_full_http_response(server_buf->cache->response, server_buf->parsed_buf);
+                    if (parse_res == -1 || (parse_res == -2 && received == 0)) {
+                        server_error(server_fd, server_buf, client_buf, http_server_error);
+                        return;
+                    } else if (parse_res >= 0) {
+                        lock_mutex(&client_buf->mutex);
+                        if (server_buf->parsed_buf.status == 200 && server_buf->parsed_buf.content_length != -1 &&
+                            server_buf->parsed_buf.content_length <= MAX_CACHED_RESPONSE_SIZE) {
+                            lock_mutex(&cache_map_mutex);
+                            if (!cache_map_insert(server_buf->buf, server_buf->cache)) {
+                                server_error(server_fd, server_buf, client_buf, http_server_error);
+                                return;
+                            }
+                            ++server_buf->cache->clients_num;
+                            unlock_mutex(&cache_map_mutex);
+                            client_buf->cache = server_buf->cache;
+                            server_buf->parsed_buf.content_length += parse_res;
+                        } else {
+                            client_buf->buf.swap(server_buf->cache->response);
+                            client_buf->parsed_buf.content_length = client_buf->buf.length() + 1;
+                            server_delete_cache(server_buf->cache);
+                            server_buf->cache = nullptr;
+                        }
+                        cond_broadcast(&client_buf->condition);
+                        unlock_mutex(&client_buf->mutex);
+                    }
                 }
             }
         } else { // through mode

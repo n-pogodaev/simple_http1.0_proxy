@@ -22,7 +22,7 @@
 #define BACKLOG 10
 #define POLL_REQUESTS_START_SIZE 1021
 
-#define TRANSFER_BUF_SIZE 1024
+#define TRANSFER_BUF_SIZE 8192
 char transfer_buf[TRANSFER_BUF_SIZE];
 
 const char *http_scheme = "http://";
