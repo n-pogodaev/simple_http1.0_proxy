@@ -873,11 +873,11 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 server_error(server_fd, server_buf, client_buf, http_server_error);
                 return;
             }
+            cache_write_unlock(server_buf->cache);
             lock_mutex(&cache_map_mutex);
             auto cache_map_found_record = cache_map.find(server_buf->buf);
             if (cache_map_found_record != cache_map.end()) { // response has been completely parsed
                 if (cache_map_found_record->second != server_buf->cache) {
-                    cache_write_unlock(server_buf->cache);
                     ++cache_map_found_record->second->clients_num;
                     lock_mutex(&client_buf->mutex);
                     client_buf->cache = cache_map_found_record->second;
@@ -889,7 +889,6 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                     return;
                 }
                 if (server_buf->cache->clients_num == 0) {
-                    cache_write_unlock(server_buf->cache);
                     unlock_mutex(&cache_map_mutex);
                     server_delete_cache(server_buf->cache);
                     reset_server_connection(server_fd, server_buf, client_buf);
@@ -897,14 +896,13 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 }
                 unlock_mutex(&cache_map_mutex);
                 if (server_buf->cache->response.length() >= server_buf->parsed_buf.content_length) {
+                    cache_write_lock(server_buf->cache);
                     server_buf->cache->is_full = true;
                     cache_write_unlock(server_buf->cache);
                     reset_server_connection(server_fd, server_buf, client_buf);
                     return;
                 }
-                cache_write_unlock(server_buf->cache);
             } else {
-                cache_write_unlock(server_buf->cache);
                 unlock_mutex(&cache_map_mutex);
                 int parse_res = parse_full_http_response(server_buf->cache->response, server_buf->parsed_buf);
                 if (parse_res == -1 || (parse_res == -2 && received == 0)) {
@@ -1003,7 +1001,8 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
             }
             cache_read_unlock(client_buf->cache);
             unlock_mutex(&client_buf->mutex);
-        } else { // through mode
+        }
+        else { // through mode
             if (client_buf->buf.empty()) {
                 while (!client_buf->cache && client_buf->buf.empty()) {
                     cond_wait(&client_buf->condition, &client_buf->mutex);
