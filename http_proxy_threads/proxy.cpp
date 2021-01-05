@@ -7,13 +7,14 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <vector>
 #include <netdb.h>
 #include <csignal>
 #include <cctype>
 #include "picohttpparser.h"
 
-#define NO_CACHE false
+#define NO_CACHE true
 
 #define MAX_CACHED_RESPONSE_SIZE (150*1024*1024)
 #define MAX_HEADERS 100
@@ -512,14 +513,14 @@ int parse_full_http_response(const std::string &response, parsed_http &parsed_bu
 }
 
 int send_data(int fd, const char *buf, size_t buf_len) {
-    int send_res = send(fd, buf, buf_len, MSG_NOSIGNAL);
+    int send_res = send(fd, buf, buf_len, MSG_NOSIGNAL | MSG_DONTWAIT);
     if (send_res < 0) {
         if (errno == ENOMEM) {
             lock_mutex(&cache_map_mutex);
             clean_cache_map();
             unlock_mutex(&cache_map_mutex);
             return 0;
-        } else if (errno == EINTR) {
+        } else if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
             return 0;
         } else {
             perror("send");
@@ -708,15 +709,15 @@ bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) 
         }
         if (*server_buf) { // sending put/post/delete content
             http_buf *serv_buf = *server_buf;
-            lock_mutex(&client_buf->mutex);
+            lock_mutex(&serv_buf->mutex);
             if (serv_buf->is_error) {
-                unlock_mutex(&client_buf->mutex);
+                unlock_mutex(&serv_buf->mutex);
                 return true;
             }
-            lock_mutex(&serv_buf->mutex);
+            lock_mutex(&client_buf->mutex);
             if (!str_append(serv_buf->buf, client_buf->transfer_buf, received)) {
-                unlock_mutex(&client_buf->mutex);
                 unlock_mutex(&serv_buf->mutex);
+                unlock_mutex(&client_buf->mutex);
                 return client_return_error_to_client(client_fd, client_buf, serv_buf, http_server_error);
             }
             cond_broadcast(&serv_buf->condition);
@@ -783,6 +784,13 @@ bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) 
     }
 }
 
+void wait_send(int fd) {
+    struct pollfd poll_req[1];
+    poll_req[0].events = POLLOUT;
+    poll_req[0].fd = fd;
+    poll(poll_req, 1, -1);
+}
+
 bool server_send(int server_fd, http_buf *client_buf, http_buf *server_buf) {
     for (;;) {
         if (is_interrupted) {
@@ -796,6 +804,11 @@ bool server_send(int server_fd, http_buf *client_buf, http_buf *server_buf) {
         lock_mutex(&server_buf->mutex);
         if (server_buf->parsed_buf.content_length != -1) { // request has a content
             int sent = send_data(server_fd, server_buf->buf.c_str(), server_buf->buf.length());
+            if (sent == 0) {
+                unlock_mutex(&server_buf->mutex);
+                wait_send(server_fd);
+                continue;
+            }
             if (sent < 0) {
                 unlock_mutex(&server_buf->mutex);
                 server_error(server_fd, server_buf, client_buf, http_service_unavailable);
@@ -817,6 +830,11 @@ bool server_send(int server_fd, http_buf *client_buf, http_buf *server_buf) {
             }
         } else { // request doesn't have a content
             int sent = send_data(server_fd, server_buf->buf.c_str() + server_buf->bytes_sent, server_buf->buf.length() - server_buf->bytes_sent);
+            if (sent == 0) {
+                unlock_mutex(&server_buf->mutex);
+                wait_send(server_fd);
+                continue;
+            }
             if (sent < 0) {
                 unlock_mutex(&server_buf->mutex);
                 server_error(server_fd, server_buf, client_buf, http_service_unavailable);
@@ -916,11 +934,12 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 }
             }
         } else { // through mode
+            lock_mutex(&client_buf->mutex);
             if (client_buf->is_error) {
+                unlock_mutex(&client_buf->mutex);
                 reset_server_connection(server_fd, server_buf, client_buf);
                 return;
             }
-            lock_mutex(&client_buf->mutex);
             if (!str_append(client_buf->buf, server_buf->transfer_buf, received)) {
                 unlock_mutex(&client_buf->mutex);
                 server_error(server_fd, server_buf, client_buf, http_server_error);
@@ -951,19 +970,26 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
         }
         lock_mutex(&client_buf->mutex);
         if (client_buf->cache) { // cache mode
-            unlock_mutex(&client_buf->mutex);
             cache_read_lock(client_buf->cache, client_buf->bytes_sent);
             if (client_buf->cache->is_error) {
                 cache_read_unlock(client_buf->cache);
+                unlock_mutex(&client_buf->mutex);
                 unsub_from_cache(client_buf->cache);
                 reset_client_connection(client_fd, server_buf, client_buf);
                 return;
             }
             int sent = send_data(client_fd, client_buf->cache->response.c_str() + client_buf->bytes_sent,
                                  client_buf->cache->response.length() - client_buf->bytes_sent);
+            if (sent == 0) {
+                cache_read_unlock(client_buf->cache);
+                unlock_mutex(&client_buf->mutex);
+                wait_send(client_fd);
+                continue;
+            }
             if (sent < 0) {
                 cache_read_unlock(client_buf->cache);
                 unsub_from_cache(client_buf->cache);
+                unlock_mutex(&client_buf->mutex);
                 reset_client_connection(client_fd, server_buf, client_buf);
                 return;
             }
@@ -971,12 +997,14 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
             if (client_buf->cache->response.length() <= client_buf->bytes_sent && client_buf->cache->is_full) {
                 cache_read_unlock(client_buf->cache);
                 unsub_from_cache(client_buf->cache);
+                unlock_mutex(&client_buf->mutex);
                 reset_client_connection(client_fd, server_buf, client_buf);
                 return;
             }
             cache_read_unlock(client_buf->cache);
+            unlock_mutex(&client_buf->mutex);
         } else { // through mode
-            if (!client_buf->cache && client_buf->buf.empty()) {
+            if (client_buf->buf.empty()) {
                 while (!client_buf->cache && client_buf->buf.empty()) {
                     cond_wait(&client_buf->condition, &client_buf->mutex);
                 }
@@ -984,6 +1012,11 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
                 continue;
             }
             int sent = send_data(client_fd, client_buf->buf.c_str(), client_buf->buf.length());
+            if (sent == 0) {
+                unlock_mutex(&client_buf->mutex);
+                wait_send(client_fd);
+                continue;
+            }
             if (sent < 0) {
                 unlock_mutex(&client_buf->mutex);
                 reset_client_connection(client_fd, server_buf, client_buf);
