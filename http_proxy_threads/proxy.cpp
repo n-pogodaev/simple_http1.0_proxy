@@ -14,7 +14,7 @@
 #include <cctype>
 #include "picohttpparser.h"
 
-#define NO_CACHE true
+#define NO_CACHE false
 
 #define MAX_CACHED_RESPONSE_SIZE (150*1024*1024)
 #define MAX_HEADERS 100
@@ -1029,10 +1029,14 @@ void client_send(int client_fd, http_buf *client_buf, http_buf *server_buf) {
                 reset_client_connection(client_fd, server_buf, client_buf);
                 return;
             } else if (client_buf->buf.empty()) {
-                while (client_buf->buf.empty()) {
+                while (client_buf->buf.empty() && client_buf->bytes_sent < client_buf->parsed_buf.content_length) {
                     cond_wait(&client_buf->condition, &client_buf->mutex);
                 }
                 unlock_mutex(&client_buf->mutex);
+                if (client_buf->bytes_sent >= client_buf->parsed_buf.content_length) {
+                    reset_client_connection(client_fd, server_buf, client_buf);
+                    return;
+                }
             } else {
                 unlock_mutex(&client_buf->mutex);
             }
