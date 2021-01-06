@@ -20,7 +20,7 @@
 #define MAX_HEADERS 100
 #define BACKLOG 10
 
-#define TRANSFER_BUF_SIZE 8192
+#define TRANSFER_BUF_SIZE 16384
 
 const char *http_scheme = "http://";
 const char *http_server_error = "HTTP/1.0 500 Internal Server Error\r\n\r\n<html><head>Server Error</head><body></body></html>";
@@ -59,7 +59,6 @@ struct parsed_http {
 };
 
 struct http_buf {
-    char transfer_buf[TRANSFER_BUF_SIZE];
     std::string buf;
     parsed_http parsed_buf;
     size_t bytes_sent{};
@@ -698,12 +697,13 @@ void create_server_send(http_buf *buf, int client_fd, bool caching, long request
 
 bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) {
     *server_buf = nullptr;
+    char transfer_buf[TRANSFER_BUF_SIZE];
     for (;;) {
         if (is_interrupted) {
             reset_client_connection(client_fd, *server_buf, client_buf);
             return false;
         }
-        int received = recv_data(client_fd, client_buf->transfer_buf, TRANSFER_BUF_SIZE);
+        int received = recv_data(client_fd, transfer_buf, TRANSFER_BUF_SIZE);
         if (received < 0) {
             reset_client_connection(client_fd, *server_buf, client_buf);
             return false;
@@ -716,7 +716,7 @@ bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) 
                 return true;
             }
             lock_mutex(&client_buf->mutex);
-            if (!str_append(serv_buf->buf, client_buf->transfer_buf, received)) {
+            if (!str_append(serv_buf->buf, transfer_buf, received)) {
                 unlock_mutex(&serv_buf->mutex);
                 unlock_mutex(&client_buf->mutex);
                 return client_return_error_to_client(client_fd, client_buf, serv_buf, http_server_error);
@@ -736,7 +736,7 @@ bool client_receive(int client_fd, http_buf *client_buf, http_buf **server_buf) 
             unlock_mutex(&client_buf->mutex);
             continue;
         }
-        if (!str_append(client_buf->buf, client_buf->transfer_buf, received)) {
+        if (!str_append(client_buf->buf, transfer_buf, received)) {
             return client_return_error_to_client(client_fd, client_buf, nullptr, http_server_error);
         }
         //printf("%s\n", client_buf.client_buf.c_str());
@@ -857,19 +857,20 @@ bool server_send(int server_fd, http_buf *client_buf, http_buf *server_buf) {
 }
 
 void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
+    char transfer_buf[TRANSFER_BUF_SIZE];
     for (;;) {
         if (is_interrupted) {
             reset_server_connection(server_fd, server_buf, client_buf);
             return;
         }
-        int received = recv_data(server_fd, server_buf->transfer_buf, TRANSFER_BUF_SIZE);
+        int received = recv_data(server_fd,transfer_buf, TRANSFER_BUF_SIZE);
         if (received < 0) {
             server_error(server_fd, server_buf, client_buf, http_service_unavailable);
             return;
         }
         if (server_buf->cache) { // caching mode, buf.buf contains get or head request
             cache_write_lock(server_buf->cache);
-            if (!str_append(server_buf->cache->response, server_buf->transfer_buf, received)) {
+            if (!str_append(server_buf->cache->response, transfer_buf, received)) {
                 cache_write_unlock(server_buf->cache);
                 server_error(server_fd, server_buf, client_buf, http_server_error);
                 return;
@@ -945,7 +946,7 @@ void server_receive(int server_fd, http_buf *client_buf, http_buf *server_buf) {
                 reset_server_connection(server_fd, server_buf, client_buf);
                 return;
             }
-            if (!str_append(client_buf->buf, server_buf->transfer_buf, received)) {
+            if (!str_append(client_buf->buf, transfer_buf, received)) {
                 unlock_mutex(&client_buf->mutex);
                 server_error(server_fd, server_buf, client_buf, http_server_error);
                 return;
